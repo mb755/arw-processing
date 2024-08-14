@@ -64,6 +64,14 @@ def default_parser(description):
         required=False,
         action="store_true",
     )
+    parser.add_argument(
+        "-lc",
+        "--lens-corrections",
+        help="Apply lens corrections",
+        required=False,
+        action="store_true",
+    )
+
     return parser
 
 

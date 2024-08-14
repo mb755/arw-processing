@@ -4,6 +4,8 @@ from skimage import exposure, restoration
 import cv2
 import os
 import configparser as cfg
+import lensfunpy
+import exifread
 
 from utils.config_parser import default_parser
 
@@ -21,6 +23,7 @@ input_file = args["input_file"]
 output_suffix = args["output_suffix"]
 config_file = args["config_file"]
 overwrite = args["overwrite"]
+lens_corrections = args["lens_corrections"]
 
 ###########################################################
 # grab initial values from config file
@@ -29,8 +32,35 @@ overwrite = args["overwrite"]
 config = cfg.ConfigParser()
 config.read(config_file)
 
-camera_name = config.get("camera", "name")
+camera_maker = config.get("camera", "maker")
+camera_model = config.get("camera", "model")
 lens_name = config.get("lens", "name")
+
+###########################################################
+# find lens and camera in lensfun database
+###########################################################
+
+
+db = lensfunpy.Database()
+cam = db.find_cameras(camera_maker, camera_model)[0]
+lens = db.find_lenses(camera=cam, lens=lens_name)[0]
+
+print(f"Camera: {cam}, Lens: {lens}", flush=True)
+
+# CR TODO: eventually switch to using maker and model from exif data
+f = open(input_file, "rb")
+tags = exifread.process_file(f)
+
+"""
+for tag in tags.keys():
+    if tag not in ('JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote'):
+        print(f"{tag}:{tags[tag]}")
+"""
+
+aperture = float(str(tags["EXIF FNumber"]))
+focal_length = float(str(tags["EXIF FocalLength"]))
+# CR TODO: read in exposure bias and maybe get a better distance estimate
+distance = 100.0
 
 
 def process_raw(file_path):
@@ -42,6 +72,34 @@ def process_raw(file_path):
 
     # Convert to float for further processing
     image = rgb.astype(np.float32) / 65535.0
+
+    # CR TODO: applying lens correction seems to make the output worse
+    if lens_corrections:
+        height, width = image.shape[:2]
+
+        mod = lensfunpy.Modifier(lens, cam.crop_factor, width, height)
+        mod.initialize(
+            focal_length,
+            aperture,
+            distance,
+            pixel_format=np.float32,
+            flags=lensfunpy.ModifyFlags.VIGNETTING | lensfunpy.ModifyFlags.TCA,
+        )
+
+        # Vignette Correction
+        mod.apply_color_modification(image)
+
+        # TCA Correction
+        undist_coords = mod.apply_subpixel_distortion()
+        image[..., 0] = cv2.remap(
+            image[..., 0], undist_coords[..., 0, :], None, cv2.INTER_LANCZOS4
+        )
+        image[..., 1] = cv2.remap(
+            image[..., 1], undist_coords[..., 1, :], None, cv2.INTER_LANCZOS4
+        )
+        image[..., 2] = cv2.remap(
+            image[..., 2], undist_coords[..., 2, :], None, cv2.INTER_LANCZOS4
+        )
 
     # 2. Auto adjustments
     # Auto-contrast
@@ -56,8 +114,6 @@ def process_raw(file_path):
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     hsv[:, :, 1] = hsv[:, :, 1] * 1.2  # Increase saturation by 20%
     image = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-
-    print(f"Image shape: {image.shape}", flush=True)
 
     # 4. Denoising and sharpening
     # Denoise
